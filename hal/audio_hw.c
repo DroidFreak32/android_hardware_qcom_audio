@@ -72,9 +72,12 @@
 #include <platform.h>
 #include "audio_extn.h"
 #include "voice_extn.h"
+#include "audio_amplifier.h"
+#include "ultrasound.h"
 
 #include "sound/compress_params.h"
 #include "sound/asound.h"
+
 
 #define COMPRESS_OFFLOAD_NUM_FRAGMENTS 4
 /*DIRECT PCM has same buffer sizes as DEEP Buffer*/
@@ -254,6 +257,8 @@ const char * const use_case_table[AUDIO_USECASE_MAX] = {
 
     [USECASE_AUDIO_PLAYBACK_AFE_PROXY] = "afe-proxy-playback",
     [USECASE_AUDIO_RECORD_AFE_PROXY] = "afe-proxy-record",
+    [USECASE_AUDIO_ULTRASOUND_RX] = "ultrasound-rx",
+    [USECASE_AUDIO_ULTRASOUND_TX] = "ultrasound-tx",
 };
 
 static const audio_usecase_t offload_usecases[] = {
@@ -483,14 +488,20 @@ static bool is_supported_format(audio_format_t format)
         format == AUDIO_FORMAT_PCM_16_BIT ||
         format == AUDIO_FORMAT_AC3 ||
         format == AUDIO_FORMAT_E_AC3 ||
-        format == AUDIO_FORMAT_DTS ||
-        format == AUDIO_FORMAT_DTS_HD ||
         format == AUDIO_FORMAT_FLAC ||
         format == AUDIO_FORMAT_ALAC ||
+#ifdef APE_OFFLOAD_ENABLED
         format == AUDIO_FORMAT_APE ||
+#endif
+#ifdef VORBIS_OFFLOAD_ENABLED
         format == AUDIO_FORMAT_VORBIS ||
+#endif
+#ifdef WMA_OFFLOAD_ENABLED
         format == AUDIO_FORMAT_WMA ||
-        format == AUDIO_FORMAT_WMA_PRO)
+        format == AUDIO_FORMAT_WMA_PRO ||
+#endif
+        format == AUDIO_FORMAT_DTS ||
+        format == AUDIO_FORMAT_DTS_HD)
            return true;
 
     return false;
@@ -525,18 +536,24 @@ static int get_snd_codec_id(audio_format_t format)
     case AUDIO_FORMAT_ALAC:
         id = SND_AUDIOCODEC_ALAC;
         break;
+#ifdef APE_OFFLOAD_ENABLED
     case AUDIO_FORMAT_APE:
         id = SND_AUDIOCODEC_APE;
         break;
+#endif
+#ifdef VORBIS_OFFLOAD_ENABLED
     case AUDIO_FORMAT_VORBIS:
         id = SND_AUDIOCODEC_VORBIS;
         break;
+#endif
+#ifdef WMA_OFFLOAD_ENABLED
     case AUDIO_FORMAT_WMA:
         id = SND_AUDIOCODEC_WMA;
         break;
     case AUDIO_FORMAT_WMA_PRO:
         id = SND_AUDIOCODEC_WMA_PRO;
         break;
+#endif
     case AUDIO_FORMAT_AC3:
         id = SND_AUDIOCODEC_AC3;
         break;
@@ -640,6 +657,10 @@ int enable_audio_route(struct audio_device *adev,
     audio_extn_sound_trigger_update_stream_status(usecase, ST_EVENT_STREAM_BUSY);
     audio_extn_listen_update_stream_status(usecase, LISTEN_EVENT_STREAM_BUSY);
     audio_extn_utils_send_app_type_cfg(adev, usecase);
+#ifdef ELLIPTIC_ULTRASOUND_ENABLED
+    if (usecase->id != USECASE_AUDIO_ULTRASOUND_RX &&
+        usecase->id != USECASE_AUDIO_ULTRASOUND_TX)
+#endif
     audio_extn_utils_send_audio_calibration(adev, usecase);
     strlcpy(mixer_path, use_case_table[usecase->id], MIXER_PATH_MAX_LENGTH);
     platform_add_backend_name(mixer_path, snd_device, usecase);
@@ -744,6 +765,7 @@ int enable_snd_device(struct audio_device *adev,
             return -EINVAL;
         }
         audio_extn_dev_arbi_acquire(snd_device);
+        amplifier_enable_devices(snd_device, true);
         audio_route_apply_and_update_path(adev->audio_route, device_name);
 
         if (SND_DEVICE_OUT_HEADPHONES == snd_device &&
@@ -800,6 +822,7 @@ int disable_snd_device(struct audio_device *adev,
             }
         } else {
             audio_route_reset_and_update_path(adev->audio_route, device_name);
+            amplifier_enable_devices(snd_device, false);
         }
 
         if (snd_device == SND_DEVICE_OUT_HDMI)
@@ -1387,6 +1410,10 @@ int select_devices(struct audio_device *adev, audio_usecase_t uc_id)
             voice_extn_compress_voip_is_started(adev))
             voice_set_sidetone(adev, out_snd_device, true);
     }
+
+    /* Rely on amplifier_set_devices to distinguish between in/out devices */
+    amplifier_set_input_devices(in_snd_device);
+    amplifier_set_output_devices(out_snd_device);
 
     /* Applicable only on the targets that has external modem.
      * Enable device command should be sent to modem only after
@@ -2199,6 +2226,9 @@ static int out_standby(struct audio_stream *stream)
             stop_compressed_output_l(out);
 
         pthread_mutex_lock(&adev->lock);
+
+        amplifier_output_stream_standby((struct audio_stream_out *) stream);
+
         out->standby = true;
         if (out->usecase == USECASE_COMPRESS_VOIP_CALL) {
             voice_extn_compress_voip_close_output_stream(stream);
@@ -2625,6 +2655,11 @@ static ssize_t out_write(struct audio_stream_out *stream, const void *buffer,
             ret = voice_extn_compress_voip_start_output_stream(out);
         else
             ret = start_output_stream(out);
+
+        if (ret == 0)
+            amplifier_output_stream_start(stream,
+                    is_offload_usecase(out->usecase));
+
         pthread_mutex_unlock(&adev->lock);
         /* ToDo: If use case is compress offload should return 0 */
         if (ret != 0) {
@@ -3108,6 +3143,9 @@ static int in_standby(struct audio_stream *stream)
             adev->adm_deregister_stream(adev->adm_data, in->capture_handle);
 
         pthread_mutex_lock(&adev->lock);
+
+        amplifier_input_stream_standby((struct audio_stream_in *) stream);
+
         in->standby = true;
         if (in->usecase == USECASE_COMPRESS_VOIP_CALL) {
             voice_extn_compress_voip_close_input_stream(stream);
@@ -3262,6 +3300,11 @@ static ssize_t in_read(struct audio_stream_in *stream, void *buffer,
             ret = voice_extn_compress_voip_start_input_stream(in);
         else
             ret = start_input_stream(in);
+
+        if (ret == 0)
+            amplifier_input_stream_start(stream);
+
+
         pthread_mutex_unlock(&adev->lock);
         if (ret != 0) {
             goto exit;
@@ -3960,12 +4003,14 @@ static int adev_set_parameters(struct audio_hw_device *dev, const char *kvpairs)
     ret = str_parms_get_int(parms, "rotation", &val);
     if (ret >= 0) {
         bool reverse_speakers = false;
+        bool reverse_camcorder_mics = false;
         switch(val) {
         // FIXME: note that the code below assumes that the speakers are in the correct placement
         //   relative to the user when the device is rotated 90deg from its default rotation. This
         //   assumption is device-specific, not platform-specific like this code.
         case 270:
             reverse_speakers = true;
+            reverse_camcorder_mics = true;
             break;
         case 0:
         case 90:
@@ -3984,6 +4029,19 @@ static int adev_set_parameters(struct audio_hw_device *dev, const char *kvpairs)
                 list_for_each(node, &adev->usecase_list) {
                     usecase = node_to_item(node, struct audio_usecase, list);
                     if (usecase->type == PCM_PLAYBACK) {
+                        select_devices(adev, usecase->id);
+                        break;
+                    }
+                }
+            }
+            if (adev->camcorder_mics_lr_swap != reverse_camcorder_mics) {
+                adev->camcorder_mics_lr_swap = reverse_camcorder_mics;
+                // only update the selected device if there is active pcm recording
+                struct audio_usecase *usecase;
+                struct listnode *node;
+                list_for_each(node, &adev->usecase_list) {
+                    usecase = node_to_item(node, struct audio_usecase, list);
+                    if (usecase->type == PCM_CAPTURE) {
                         select_devices(adev, usecase->id);
                         break;
                     }
@@ -4041,7 +4099,28 @@ static int adev_set_parameters(struct audio_hw_device *dev, const char *kvpairs)
         }
     }
 
+    ret = str_parms_get_int(parms, "ultrasound_enable", &val);
+    if (ret >= 0) {
+        if (val == 1) {
+            us_start();
+        } else {
+            us_stop();
+        }
+    }
+
+    ret = str_parms_get_int(parms, "ultrasound_set_manual_calibration", &val);
+    if (ret >= 0) {
+        us_set_manual_cal(val);
+    }
+
+    ret = str_parms_get_int(parms, "ultrasound_set_sensitivity", &val);
+    if (ret >= 0) {
+        us_set_sensitivity(val);
+    }
+
     audio_extn_set_parameters(adev, parms);
+    amplifier_set_parameters(parms);
+
     // reconfigure should be done only after updating a2dpstate in audio extn
     ret = str_parms_get_str(parms,"reconfigA2dp", value, sizeof(value));
     if (ret >= 0) {
@@ -4164,6 +4243,8 @@ static int adev_set_mode(struct audio_hw_device *dev, audio_mode_t mode)
     pthread_mutex_lock(&adev->lock);
     if (adev->mode != mode) {
         ALOGD("%s: mode %d\n", __func__, mode);
+        if (amplifier_set_mode(mode) != 0)
+            ALOGE("Failed setting amplifier mode");
         adev->mode = mode;
         if ((mode == AUDIO_MODE_NORMAL) && voice_is_in_call(adev)) {
             voice_stop_call(adev);
@@ -4447,14 +4528,16 @@ static int adev_dump(const audio_hw_device_t *device __unused,
 
 static int adev_close(hw_device_t *device)
 {
-    struct audio_device *adev = (struct audio_device *)device;
+    struct audio_device *adev_temp = (struct audio_device *)device;
 
-    if (!adev)
+    if (!adev_temp)
         return 0;
 
     pthread_mutex_lock(&adev_init_lock);
 
     if ((--audio_device_ref_count) == 0) {
+        if (amplifier_close() != 0)
+            ALOGE("Amplifier close failed");
         audio_extn_sound_trigger_deinit(adev);
         audio_extn_listen_deinit(adev);
         audio_extn_utils_release_streams_output_cfg_list(&adev->streams_output_cfg_list);
@@ -4466,6 +4549,7 @@ static int adev_close(hw_device_t *device)
         free(device);
         adev = NULL;
     }
+    us_deinit();
     pthread_mutex_unlock(&adev_init_lock);
 
     return 0;
@@ -4649,6 +4733,12 @@ static int adev_open(const hw_module_t *module, const char *name,
     adev->bt_wb_speech_enabled = false;
 
     audio_extn_ds2_enable(adev);
+
+    if (amplifier_open(adev) != 0)
+        ALOGE("Amplifier initialization failed");
+
+    us_init(adev);
+
     *device = &adev->device.common;
 
     audio_extn_utils_update_streams_output_cfg_list(adev->platform, adev->mixer,

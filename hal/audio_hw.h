@@ -40,6 +40,7 @@
 
 #include <stdlib.h>
 #include <cutils/list.h>
+#include <hardware/audio_amplifier.h>
 #include <hardware/audio.h>
 #include <tinyalsa/asoundlib.h>
 #include <tinycompress/tinycompress.h>
@@ -140,6 +141,9 @@ enum {
 
     USECASE_AUDIO_PLAYBACK_AFE_PROXY,
     USECASE_AUDIO_RECORD_AFE_PROXY,
+
+    USECASE_AUDIO_ULTRASOUND_RX,
+    USECASE_AUDIO_ULTRASOUND_TX,
 
     AUDIO_USECASE_MAX
 };
@@ -337,6 +341,7 @@ struct audio_device {
     struct audio_route *audio_route;
     int acdb_settings;
     bool speaker_lr_swap;
+    bool camcorder_mics_lr_swap;
     struct voice voice;
     unsigned int cur_hdmi_channels;
     audio_format_t cur_hdmi_format;
@@ -385,6 +390,7 @@ struct audio_device {
     int perf_lock_opts[MAX_PERF_LOCK_OPTS];
     int perf_lock_opts_size;
     bool native_playback_enabled;
+    amplifier_device_t *amp;
 };
 
 int select_devices(struct audio_device *adev,
